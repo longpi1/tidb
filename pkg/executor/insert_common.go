@@ -1414,26 +1414,54 @@ func (e *InsertValues) addRecord(ctx context.Context, row []types.Datum) error {
 	return e.addRecordWithAutoIDHint(ctx, row, 0)
 }
 
+// 在InsertValues对象中添加记录，同时考虑自动ID的预留数量。
+//
+// 如果不启用即时约束检查（ConstraintCheckInPlace），则假设键不存在。
+//
+// 根据reserveAutoIDCount的值，选择性地传递WithReserveAutoIDHint选项给AddRecord。
+//
+// 如果添加记录成功：
+//   - 更新受影响的行数。
+//   - 如果lastInsertID不为零，设置最后插入的ID。
+//   - 如果不在批处理模式下，执行外键检查。
 func (e *InsertValues) addRecordWithAutoIDHint(
-	ctx context.Context, row []types.Datum, reserveAutoIDCount int,
+	ctx context.Context,
+	row []types.Datum,
+	reserveAutoIDCount int,
 ) (err error) {
+	// 获取当前会话变量
 	vars := e.Ctx().GetSessionVars()
+
+	// 如果不启用即时约束检查，假设键不存在
 	if !vars.ConstraintCheckInPlace {
 		vars.PresumeKeyNotExists = true
 	}
+
+	// 根据预留自动ID数量选择AddRecord调用方式
 	if reserveAutoIDCount > 0 {
+		// 传递WithReserveAutoIDHint选项，预留指定数量的自动ID
 		_, err = e.Table.AddRecord(e.Ctx().GetTableCtx(), row, table.WithCtx(ctx), table.WithReserveAutoIDHint(reserveAutoIDCount))
 	} else {
+		// 不预留自动ID
 		_, err = e.Table.AddRecord(e.Ctx().GetTableCtx(), row, table.WithCtx(ctx))
 	}
+
+	// 还原假设键不存在的状态
 	vars.PresumeKeyNotExists = false
+
 	if err != nil {
 		return err
 	}
+
+	// 记录受影响的行数
 	vars.StmtCtx.AddAffectedRows(1)
+
+	// 如果lastInsertID不为零，设置最后插入的ID
 	if e.lastInsertID != 0 {
 		vars.SetLastInsertID(e.lastInsertID)
 	}
+
+	// 如果不在批处理模式下，执行外键检查
 	if !vars.StmtCtx.BatchCheck {
 		for _, fkc := range e.fkChecks {
 			err = fkc.insertRowNeedToCheck(vars.StmtCtx, row)
@@ -1442,6 +1470,7 @@ func (e *InsertValues) addRecordWithAutoIDHint(
 			}
 		}
 	}
+
 	return nil
 }
 

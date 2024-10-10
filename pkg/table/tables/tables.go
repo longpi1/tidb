@@ -622,9 +622,11 @@ func (t *TableCommon) UpdateRecord(ctx context.Context, sctx table.MutateContext
 
 	writeBufs := sessVars.GetWriteStmtBufs()
 	adjustRowValuesBuf(writeBufs, len(buffer.Row))
+	//构造 Row Key:
 	key := t.RecordKey(h)
 	sc, rd := sessVars.StmtCtx, &sessVars.RowEncoder
 	checksums, writeBufs.RowValBuf = t.calcChecksums(sctx, h, checksumData, writeBufs.RowValBuf)
+	// 构造 Row Value:
 	writeBufs.RowValBuf, err = tablecodec.EncodeRow(sc.TimeZone(), buffer.Row, buffer.ColIDs,
 		writeBufs.RowValBuf, writeBufs.AddRowValues, rd, checksums...)
 	err = sc.HandleError(err)
@@ -859,58 +861,65 @@ func checkTempTableSize(ctx table.MutateContext, tmpTable tableutil.TempTable, t
 	return nil
 }
 
-// AddRecord implements table.Table AddRecord interface.
+// AddRecord 实现了 table.Table 的 AddRecord 接口，用于向表中添加一条记录。
 func (t *TableCommon) AddRecord(sctx table.MutateContext, r []types.Datum, opts ...table.AddRecordOption) (recordID kv.Handle, err error) {
+	// 获取当前事务，如果事务开启失败则返回错误。
 	txn, err := sctx.Txn(true)
 	if err != nil {
 		return nil, err
 	}
 
-	// TODO: optimize the allocation (and calculation) of opt.
+	// TODO: 优化 opt 的分配和计算。
 	var opt table.AddRecordOpt
+	// 遍历所有的附加选项并应用到 opt 上。
 	for _, fn := range opts {
 		fn.ApplyOn(&opt)
 	}
 
+	// 如果当前表是临时表，且添加临时表成功，则检查表大小是否超过限制。
 	if m := t.Meta(); m.TempTableType != model.TempTableNone {
 		if tmpTable := addTemporaryTable(sctx, m); tmpTable != nil {
 			if err := checkTempTableSize(sctx, tmpTable, m); err != nil {
 				return nil, err
 			}
+			// 延迟处理表大小检查，确保事务的大小变化及时更新。
 			defer handleTempTableSize(tmpTable, txn.Size(), txn)
 		}
 	}
 
+	// ctx 用于跟踪和记录操作的上下文信息，可能从 opt 中获取。
 	var ctx context.Context
 	if opt.Ctx != nil {
 		ctx = opt.Ctx
 		var r tracing.Region
 		r, ctx = tracing.StartRegionEx(ctx, "table.AddRecord")
-		defer r.End()
+		defer r.End() // 操作完成后结束跟踪。
 	} else {
 		ctx = context.Background()
 	}
-	var hasRecordID bool
-	cols := t.Cols()
-	// opt.IsUpdate is a flag for update.
-	// If handle ID is changed when update, update will remove the old record first, and then call `AddRecord` to add a new record.
-	// Currently, only insert can set _tidb_rowid, update can not update _tidb_rowid.
+
+	var hasRecordID bool // 标记是否已有记录 ID。
+	cols := t.Cols()     // 获取表的所有列。
+
+	// 如果是更新操作，并且行数据包含 `_tidb_rowid`，则直接取它作为记录 ID。
 	if len(r) > len(cols) && !opt.IsUpdate {
-		// The last value is _tidb_rowid.
 		recordID = kv.IntHandle(r[len(r)-1].GetInt64())
 		hasRecordID = true
 	} else {
+		// 如果表有主键作为 handle 或者是通用 handle，则根据主键生成记录 ID。
 		tblInfo := t.Meta()
 		txn.CacheTableInfo(t.physicalTableID, tblInfo)
 		if tblInfo.PKIsHandle {
 			recordID = kv.IntHandle(r[tblInfo.GetPkColInfo().Offset].GetInt64())
 			hasRecordID = true
 		} else if tblInfo.IsCommonHandle {
+			// 对于通用 handle，拼接主键列的值生成 handle。
 			pkIdx := FindPrimaryIndex(tblInfo)
 			pkDts := make([]types.Datum, 0, len(pkIdx.Columns))
 			for _, idxCol := range pkIdx.Columns {
 				pkDts = append(pkDts, r[idxCol.Offset])
 			}
+			// 对主键值进行截断，确保符合索引规范。
 			tablecodec.TruncateIndexValues(tblInfo, pkIdx, pkDts)
 			var handleBytes []byte
 			handleBytes, err = codec.EncodeKey(sctx.GetSessionVars().StmtCtx.TimeZone(), nil, pkDts...)
@@ -925,12 +934,11 @@ func (t *TableCommon) AddRecord(sctx table.MutateContext, r []types.Datum, opts 
 			hasRecordID = true
 		}
 	}
+
+	// 如果没有 recordID，且需要保留自动递增 ID，则分配一批 ID。
 	if !hasRecordID {
 		if opt.ReserveAutoID > 0 {
-			// Reserve a batch of auto ID in the statement context.
-			// The reserved ID could be used in the future within this statement, by the
-			// following AddRecord() operation.
-			// Make the IDs continuous benefit for the performance of TiKV.
+			// 在语句上下文中保留一批自动递增 ID。
 			sessVars := sctx.GetSessionVars()
 			stmtCtx := sessVars.StmtCtx
 			stmtCtx.BaseRowID, stmtCtx.MaxRowID, err = AllocHandleIDs(ctx, sctx, t, uint64(opt.ReserveAutoID))
@@ -939,16 +947,19 @@ func (t *TableCommon) AddRecord(sctx table.MutateContext, r []types.Datum, opts 
 			}
 		}
 
+		// 分配新的 handle。
 		recordID, err = AllocHandle(ctx, sctx, t)
 		if err != nil {
 			return nil, err
 		}
 	}
 
+	// 以下变量用于保存需要插入二进制日志的数据。
 	var binlogColIDs []int64
 	var binlogRow []types.Datum
 	var checksums []uint32
 
+	// 这是一块用于减少内存分配的可重用缓存，仅在当前函数调用期间有效。
 	// a reusable buffer to save malloc
 	// Note: The buffer should not be referenced or modified outside this function.
 	// It can only act as a temporary buffer for the current function call.
@@ -1042,9 +1053,11 @@ func (t *TableCommon) AddRecord(sctx table.MutateContext, r []types.Datum, opts 
 	}
 	writeBufs := sessVars.GetWriteStmtBufs()
 	adjustRowValuesBuf(writeBufs, len(buffer.Row))
+	// 构造 Row key:
 	key := t.RecordKey(recordID)
 	sc, rd := sessVars.StmtCtx, &sessVars.RowEncoder
 	checksums, writeBufs.RowValBuf = t.calcChecksums(sctx, recordID, checksumData, writeBufs.RowValBuf)
+	// 构造 Row Value:
 	writeBufs.RowValBuf, err = tablecodec.EncodeRow(sc.TimeZone(), buffer.Row, buffer.ColIDs,
 		writeBufs.RowValBuf, writeBufs.AddRowValues, rd, checksums...)
 	err = sc.HandleError(err)
@@ -1121,7 +1134,7 @@ func (t *TableCommon) AddRecord(sctx table.MutateContext, r []types.Datum, opts 
 			}
 		}
 	}
-	// Insert new entries into indices.
+	// Insert new entries into indices.  构造 Index 数据
 	h, err := t.addIndices(sctx, recordID, r, txn, createIdxOpts)
 	if err != nil {
 		return h, err
