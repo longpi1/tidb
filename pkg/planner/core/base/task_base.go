@@ -17,23 +17,29 @@ package base
 // Note: appending the new adding method to the last, for the convenience of easy
 // locating in other implementor from other package.
 
-// Task is a new version of `PhysicalPlanInfo`. It stores cost information for a task.
-// A task may be CopTask, RootTask, MPPTaskMeta or a ParallelTask.
+// Task 是 `PhysicalPlanInfo` 的新版本。它存储任务的代价信息。
+// 一个任务可能是 CopTask、RootTask、MPPTaskMeta 或 ParallelTask。
 type Task interface {
-	// Count returns current task's row count.
+	// Count 返回当前任务的行数估计。
 	Count() float64
-	// Copy return a shallow copy of current task with the same pointer to p.
+	// Copy 返回当前任务的浅拷贝，与 p 指向相同的计划。
 	Copy() Task
-	// Plan returns current task's plan.
+	// Plan 返回当前任务的物理计划。
 	Plan() PhysicalPlan
-	// Invalid returns whether current task is invalid.
+	// Invalid 返回当前任务是否无效。
 	Invalid() bool
-	// ConvertToRootTask will convert current task as root type.
-	// Here we change return type as interface to avoid import cycle.
-	// Basic interface definition shouldn't depend on concrete implementation structure.
+	// ConvertToRootTask 将当前任务转换为根任务类型。
+	// 这里我们将返回类型更改为接口以避免导入循环。
+	// 基本接口定义不应依赖于具体的实现结构。
 	ConvertToRootTask(ctx PlanContext) Task
-	// MemoryUsage returns the memory usage of current task.
+	// MemoryUsage 返回当前任务的内存使用量估计。
 	MemoryUsage() int64
+	//Count(): 返回任务的估计行数，用于优化器评估执行计划的代价。
+	//Copy(): 创建一个任务的浅拷贝，新的任务与原任务共享底层的物理计划，但可以拥有不同的代价信息或其他属性。
+	//Plan(): 返回任务对应的物理执行计划 (PhysicalPlan)。
+	//Invalid(): 判断任务是否有效。当优化器无法生成有效的执行计划时，会返回一个无效的任务。
+	//ConvertToRootTask(): 将当前任务转换为根任务类型 (RootTask)。根任务通常是整个查询计划的顶层任务。
+	//MemoryUsage(): 返回任务的估计内存使用量，用于优化器评估执行计划的资源消耗。
 }
 
 // InvalidTask is just a common invalid singleton instance initialized by core's empty RootTask.

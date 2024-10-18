@@ -282,41 +282,56 @@ func checkStableResultMode(sctx base.PlanContext) bool {
 	return s.EnableStableResultMode && (!st.InInsertStmt && !st.InUpdateStmt && !st.InDeleteStmt && !st.InLoadDataStmt)
 }
 
-// doOptimize optimizes a logical plan into a physical plan,
-// while also returning the optimized logical plan, the final physical plan, and the cost of the final plan.
-// The returned logical plan is necessary for generating plans for Common Table Expressions (CTEs).
+// doOptimize 函数将逻辑计划优化为物理计划，同时返回优化后的逻辑计划、最终的物理计划和最终计划的成本。
+// 返回的逻辑计划对于生成公共表表达式 (CTE) 的计划是必要的。
 func doOptimize(
-	ctx context.Context,
-	sctx base.PlanContext,
-	flag uint64,
-	logic base.LogicalPlan,
+	ctx context.Context, // 上下文信息
+	sctx base.PlanContext, // 计划上下文，包含会话变量、统计信息等
+	flag uint64, // 优化标志，控制优化器的行为
+	logic base.LogicalPlan, // 待优化的逻辑计划
 ) (base.LogicalPlan, base.PhysicalPlan, float64, error) {
-	sessVars := sctx.GetSessionVars()
+	sessVars := sctx.GetSessionVars() // 获取会话变量
+
+	// 根据逻辑计划调整优化标志
 	flag = adjustOptimizationFlags(flag, logic)
+
+	// 对逻辑计划进行逻辑优化，例如谓词下推、列裁剪等
 	logic, err := logicalOptimize(ctx, flag, logic)
 	if err != nil {
 		return nil, nil, 0, err
 	}
 
+	// 检查逻辑计划中是否存在笛卡尔积，如果存在且不允许笛卡尔积，则返回错误
 	if !AllowCartesianProduct.Load() && existsCartesianProduct(logic) {
 		return nil, nil, 0, errors.Trace(plannererrors.ErrCartesianProductUnsupported)
 	}
+
+	// 获取强制指定的计划编号，用于选择特定的执行计划
 	planCounter := base.PlanCounterTp(sessVars.StmtCtx.StmtHints.ForceNthPlan)
 	if planCounter == 0 {
-		planCounter = -1
+		planCounter = -1 // 默认情况下不强制指定计划编号
 	}
+
+	// 对逻辑计划进行物理优化，选择最佳的物理执行计划，并计算其成本
 	physical, cost, err := physicalOptimize(logic, &planCounter)
 	if err != nil {
 		return nil, nil, 0, err
 	}
+
+	// 对物理计划进行后优化，例如添加内存限制、选择合适的算子实现等
 	finalPlan := postOptimize(ctx, sctx, physical)
 
+	// 如果启用了 CETrace，则完善 CETrace 信息
 	if sessVars.StmtCtx.EnableOptimizerCETrace {
 		refineCETrace(sctx)
 	}
+
+	// 如果启用了 OptimizeTrace，则记录最终的物理计划
 	if sessVars.StmtCtx.EnableOptimizeTrace {
 		sessVars.StmtCtx.OptimizeTracer.RecordFinalPlan(finalPlan.BuildPlanTrace())
 	}
+
+	// 返回优化后的逻辑计划、最终的物理计划、计划成本和错误信息
 	return logic, finalPlan, cost, nil
 }
 
@@ -981,13 +996,21 @@ func LogicalOptimizeTest(ctx context.Context, flag uint64, logic base.LogicalPla
 	return logicalOptimize(ctx, flag, logic)
 }
 
+// logicalOptimize 函数对逻辑计划进行逻辑优化，例如谓词下推、列裁剪等。
 func logicalOptimize(ctx context.Context, flag uint64, logic base.LogicalPlan) (base.LogicalPlan, error) {
+	// 如果启用了优化器调试跟踪，则进入调试上下文
 	if logic.SCtx().GetSessionVars().StmtCtx.EnableOptimizerDebugTrace {
 		debugtrace.EnterContextCommon(logic.SCtx())
 		defer debugtrace.LeaveContextCommon(logic.SCtx())
 	}
+
+	// 创建默认的逻辑优化选项
 	opt := optimizetrace.DefaultLogicalOptimizeOption()
+
+	// 获取会话变量
 	vars := logic.SCtx().GetSessionVars()
+
+	// 如果启用了优化跟踪，则创建优化跟踪器
 	if vars.StmtCtx.EnableOptimizeTrace {
 		vars.StmtCtx.OptimizeTracer = &tracing.OptimizeTracer{}
 		tracer := &tracing.LogicalOptimizeTracer{
@@ -998,29 +1021,36 @@ func logicalOptimize(ctx context.Context, flag uint64, logic base.LogicalPlan) (
 			vars.StmtCtx.OptimizeTracer.Logical = tracer
 		}()
 	}
+
 	var err error
-	var againRuleList []logicalOptRule
+	var againRuleList []logicalOptRule // 存储需要再次优化的交互规则
+
+	// 遍历逻辑优化规则列表
 	for i, rule := range optRuleList {
-		// The order of flags is same as the order of optRule in the list.
-		// We use a bitmask to record which opt rules should be used. If the i-th bit is 1, it means we should
-		// apply i-th optimizing rule.
-		if flag&(1<<uint(i)) == 0 || isLogicalRuleDisabled(rule) {
+		// 规则标志的顺序与规则列表中的顺序相同。
+		// 我们使用位掩码来记录应该使用哪些优化规则。如果第 i 位为 1，则表示我们应该应用第 i 个优化规则。
+		if flag&(1<<uint(i)) == 0 || isLogicalRuleDisabled(rule) { // 检查是否启用了该规则，以及该规则是否被禁用
 			continue
 		}
+
+		// 记录优化规则执行前的逻辑计划
 		opt.AppendBeforeRuleOptimize(i, rule.name(), logic.BuildPlanTrace)
+
+		// 应用优化规则
 		var planChanged bool
 		logic, planChanged, err = rule.optimize(ctx, logic, opt)
 		if err != nil {
 			return nil, err
 		}
-		// Compute interaction rules that should be optimized again
+
+		// 计算需要再次优化的交互规则
 		interactionRule, ok := optInteractionRuleList[rule]
 		if planChanged && ok && isLogicalRuleDisabled(interactionRule) {
 			againRuleList = append(againRuleList, interactionRule)
 		}
 	}
 
-	// Trigger the interaction rule
+	// 触发交互规则
 	for i, rule := range againRuleList {
 		opt.AppendBeforeRuleOptimize(i, rule.name(), logic.BuildPlanTrace)
 		logic, _, err = rule.optimize(ctx, logic, opt)
@@ -1029,7 +1059,9 @@ func logicalOptimize(ctx context.Context, flag uint64, logic base.LogicalPlan) (
 		}
 	}
 
+	// 记录最终的逻辑计划
 	opt.RecordFinalLogicalPlan(logic.BuildPlanTrace)
+
 	return logic, err
 }
 
@@ -1038,24 +1070,31 @@ func isLogicalRuleDisabled(r logicalOptRule) bool {
 	return disabled
 }
 
+// physicalOptimize 对逻辑计划进行物理优化，选择最佳的物理执行计划。
 func physicalOptimize(logic base.LogicalPlan, planCounter *base.PlanCounterTp) (plan base.PhysicalPlan, cost float64, err error) {
+	// 如果开启了优化器调试跟踪，则进入调试上下文。
 	if logic.SCtx().GetSessionVars().StmtCtx.EnableOptimizerDebugTrace {
 		debugtrace.EnterContextCommon(logic.SCtx())
 		defer debugtrace.LeaveContextCommon(logic.SCtx())
 	}
+	// 递归地推导逻辑计划中每个算子的统计信息。
 	if _, err := logic.RecursiveDeriveStats(nil); err != nil {
 		return nil, 0, err
 	}
 
+	// 为逻辑计划准备可能的属性，例如排序顺序、数据分布等。
 	preparePossibleProperties(logic)
 
+	// 定义根节点的物理属性，期望获取所有数据。
 	prop := &property.PhysicalProperty{
 		TaskTp:      property.RootTaskType,
 		ExpectedCnt: math.MaxFloat64,
 	}
 
+	// 创建默认的物理优化选项。
 	opt := optimizetrace.DefaultPhysicalOptimizeOption()
 	stmtCtx := logic.SCtx().GetSessionVars().StmtCtx
+	// 如果开启了优化跟踪，则创建跟踪器并记录优化过程。
 	if stmtCtx.EnableOptimizeTrace {
 		tracer := &tracing.PhysicalOptimizeTracer{
 			PhysicalPlanCostDetails: make(map[string]*tracing.PhysicalPlanCostDetail),
@@ -1063,10 +1102,12 @@ func physicalOptimize(logic base.LogicalPlan, planCounter *base.PlanCounterTp) (
 		}
 		opt = opt.WithEnableOptimizeTracer(tracer)
 		defer func() {
+			// 捕获 panic，确保在发生 panic 时也能记录跟踪信息。
 			r := recover()
 			if r != nil {
 				panic(r) /* pass panic to upper function to handle */
 			}
+			// 如果没有错误，则记录最终的物理计划跟踪信息。
 			if err == nil {
 				tracer.RecordFinalPlanTrace(plan.BuildPlanTrace())
 				stmtCtx.OptimizeTracer.Physical = tracer
@@ -1074,26 +1115,34 @@ func physicalOptimize(logic base.LogicalPlan, planCounter *base.PlanCounterTp) (
 		}()
 	}
 
+	// 重置 TaskMap 的备份时间戳。
 	logic.SCtx().GetSessionVars().StmtCtx.TaskMapBakTS = 0
+	// 为逻辑计划找到最佳的执行任务，包括物理计划和执行代价。
 	t, _, err := logic.FindBestTask(prop, planCounter, opt)
 	if err != nil {
 		return nil, 0, err
 	}
+	// 如果 planCounter 大于 0，说明 nth_plan() 参数超出范围。
 	if *planCounter > 0 {
 		logic.SCtx().GetSessionVars().StmtCtx.AppendWarning(errors.NewNoStackErrorf("The parameter of nth_plan() is out of range"))
 	}
+	// 如果没有找到有效的执行任务，则返回错误。
 	if t.Invalid() {
 		errMsg := "Can't find a proper physical plan for this query"
+		// 如果是 TiFlash 分布式部署且不允许 MPP，则添加额外的错误信息。
 		if config.GetGlobalConfig().DisaggregatedTiFlash && !logic.SCtx().GetSessionVars().IsMPPAllowed() {
 			errMsg += ": cop and batchCop are not allowed in disaggregated tiflash mode, you should turn on tidb_allow_mpp switch"
 		}
 		return nil, 0, plannererrors.ErrInternal.GenWithStackByArgs(errMsg)
 	}
 
+	// 解析物理计划中的索引信息。
 	if err = t.Plan().ResolveIndices(); err != nil {
 		return nil, 0, err
 	}
+	// 获取物理计划的执行代价。
 	cost, err = getPlanCost(t.Plan(), property.RootTaskType, optimizetrace.NewDefaultPlanCostOption())
+	// 返回最佳的物理计划、执行代价和错误信息。
 	return t.Plan(), cost, err
 }
 

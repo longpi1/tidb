@@ -158,17 +158,24 @@ out:
 // Create creates a new entry in the kvIndex data.
 // If the index is unique and there is an existing entry with the same key,
 // Create will return the existing entry's handle as the first return value, ErrKeyExists as the second return value.
+// Create 在 kvIndex 数据中创建一个新的条目。
+// 如果索引是唯一的且存在具有相同键的条目，
+// Create 将返回现有条目的句柄作为第一个返回值，ErrKeyExists 作为第二个返回值。
 func (c *index) Create(sctx table.MutateContext, txn kv.Transaction, indexedValue []types.Datum, h kv.Handle, handleRestoreData []types.Datum, opts ...table.CreateIdxOptFunc) (kv.Handle, error) {
+	// 如果索引是唯一的，则缓存表信息
 	if c.Meta().Unique {
 		txn.CacheTableInfo(c.phyTblID, c.tblInfo)
 	}
+	// 处理传入的选项
 	var opt table.CreateIdxOpt
 	for _, fn := range opts {
 		fn(&opt)
 	}
 
+	// 获取索引值
 	indexedValues := c.getIndexedValue(indexedValue)
 	ctx := opt.Ctx
+	// 处理 tracing
 	if ctx != nil {
 		var r tracing.Region
 		r, ctx = tracing.StartRegionEx(ctx, "index.Create")
@@ -176,16 +183,21 @@ func (c *index) Create(sctx table.MutateContext, txn kv.Transaction, indexedValu
 	} else {
 		ctx = context.TODO()
 	}
+	// 获取 SessionVars 和 WriteStmtBufs
 	vars := sctx.GetSessionVars()
 	writeBufs := vars.GetWriteStmtBufs()
+	// 获取是否跳过检查标志
 	skipCheck := vars.StmtCtx.BatchCheck
 	sc := sctx.GetSessionVars().StmtCtx
+	// 遍历所有索引值
 	for _, value := range indexedValues {
+		// 生成索引键
 		key, distinct, err := c.GenIndexKey(sc.ErrCtx(), sc.TimeZone(), value, h, writeBufs.IndexKeyBuf)
 		if err != nil {
 			return nil, err
 		}
 
+		// 处理临时索引键
 		var (
 			tempKey         []byte
 			keyVer          byte
@@ -199,20 +211,19 @@ func (c *index) Create(sctx table.MutateContext, txn kv.Transaction, indexedValu
 			}
 		}
 
+		// 对于流水线 DML，禁用 untouched 优化以避免 MemBuffer.Get() 的额外 RPC。
 		if txn.IsPipelined() {
-			// For pipelined DML, disable the untouched optimization to avoid extra RPCs for MemBuffer.Get().
-			// TODO: optimize this.
 			opt.Untouched = false
 		}
 
+		// 如果索引 kv 未被触及（未更改），并且键/值已存在于内存缓冲区中，
+		// 则不应使用未提交标志覆盖该键。
+		// 因此，如果键存在，则不执行任何操作并返回。
 		if opt.Untouched {
 			txn, err1 := sctx.Txn(true)
 			if err1 != nil {
 				return nil, err1
 			}
-			// If the index kv was untouched(unchanged), and the key/value already exists in mem-buffer,
-			// should not overwrite the key with un-commit flag.
-			// So if the key exists, just do nothing and return.
 			v, err := txn.GetMemBuffer().Get(ctx, key)
 			if err == nil {
 				if len(v) != 0 {
@@ -221,6 +232,7 @@ func (c *index) Create(sctx table.MutateContext, txn kv.Transaction, indexedValu
 				// The key is marked as deleted in the memory buffer, as the existence check is done lazily
 				// for optimistic transactions by default. The "untouched" key could still exist in the store,
 				// it's needed to commit this key to do the existence check so unset the untouched flag.
+				// 处理内存缓冲中标记为已删除的键
 				if !txn.IsPessimistic() {
 					keyFlags, err := txn.GetMemBuffer().GetFlags(key)
 					if err != nil {
@@ -233,11 +245,12 @@ func (c *index) Create(sctx table.MutateContext, txn kv.Transaction, indexedValu
 			}
 		}
 
-		// save the key buffer to reuse.
+		// 保存键缓冲以便重用
 		writeBufs.IndexKeyBuf = key
 		c.initNeedRestoreData.Do(func() {
 			c.needRestoredData = NeedRestoredData(c.idxInfo.Columns, c.tblInfo.Columns)
 		})
+		// 生成索引值
 		idxVal, err := tablecodec.GenIndexValuePortal(sctx.GetSessionVars().StmtCtx.TimeZone(), c.tblInfo, c.idxInfo,
 			c.needRestoredData, distinct, opt.Untouched, value, h, c.phyTblID, handleRestoreData, nil)
 		err = sctx.GetSessionVars().StmtCtx.HandleError(err)
@@ -245,8 +258,10 @@ func (c *index) Create(sctx table.MutateContext, txn kv.Transaction, indexedValu
 			return nil, err
 		}
 
+		// 处理断言忽略的情况
 		opt.IgnoreAssertion = opt.IgnoreAssertion || c.idxInfo.State != model.StatePublic
 
+		// 处理唯一索引或跳过检查的情况
 		if !distinct || skipCheck || opt.Untouched {
 			val := idxVal
 			if opt.Untouched && (keyIsTempIdxKey || len(tempKey) > 0) {
@@ -283,57 +298,69 @@ func (c *index) Create(sctx table.MutateContext, txn kv.Transaction, indexedValu
 			continue
 		}
 
+		// 检查键是否已经存在
 		var value []byte
 		if c.tblInfo.TempTableType != model.TempTableNone {
-			// Always check key for temporary table because it does not write to TiKV
+			// 对于临时表，始终检查键，因为它不会写入 TiKV
 			value, err = txn.Get(ctx, key)
 		} else if (txn.IsPipelined() || sctx.GetSessionVars().LazyCheckKeyNotExists()) && !keyIsTempIdxKey {
-			// For temp index keys, we can't get the temp value from memory buffer, even if the lazy check is enabled.
-			// Otherwise, it may cause the temp index value to be overwritten, leading to data inconsistency.
+			// 对于流水线事务或启用延迟检查且不是临时索引键的情况，从内存缓冲区获取本地值
 			value, err = txn.GetMemBuffer().GetLocal(ctx, key)
 		} else {
+			// 其他情况，从 TiKV 获取值
 			value, err = txn.Get(ctx, key)
 		}
 		if err != nil && !kv.IsErrNotFound(err) {
 			return nil, err
 		}
+
 		var tempIdxVal tablecodec.TempIndexValue
 		if len(value) > 0 && keyIsTempIdxKey {
+			// 如果是临时索引键且值不为空，则解码临时索引值
 			tempIdxVal, err = tablecodec.DecodeTempIndexValue(value)
 			if err != nil {
 				return nil, err
 			}
 		}
-		// The index key value is not found or deleted.
+
 		if err != nil || len(value) == 0 || (!tempIdxVal.IsEmpty() && tempIdxVal.Current().Delete) {
 			val := idxVal
+			// 延迟检查：流水线事务或启用了延迟检查且获取值时出错
 			lazyCheck := (txn.IsPipelined() || sctx.GetSessionVars().LazyCheckKeyNotExists()) && err != nil
 			if keyIsTempIdxKey {
+				// 如果是临时索引键，则编码临时索引值元素
 				tempVal := tablecodec.TempIndexValueElem{Value: idxVal, KeyVer: keyVer, Distinct: true}
 				val = tempVal.Encode(value)
 			}
+			// 检查是否需要设置 PresumeKeyNotExists 标志
 			needPresumeNotExists, err := needPresumeKeyNotExistsFlag(ctx, txn, key, tempKey, h,
 				keyIsTempIdxKey, c.tblInfo.ID)
 			if err != nil {
 				return nil, err
 			}
 			if lazyCheck {
+				// 延迟检查
 				var flags []kv.FlagsOp
 				if needPresumeNotExists {
+					// 设置 PresumeKeyNotExists 标志
 					flags = []kv.FlagsOp{kv.SetPresumeKeyNotExists}
 				}
+				// 如果是悲观事务且不在限制性 SQL 中且连接 ID 大于 0，则设置 NeedConstraintCheckInPrewrite 标志
 				if !vars.ConstraintCheckInPlacePessimistic && vars.TxnCtx.IsPessimistic && vars.InTxn() &&
 					!vars.InRestrictedSQL && vars.ConnectionID > 0 {
 					flags = append(flags, kv.SetNeedConstraintCheckInPrewrite)
 				}
+				// 将键值对和标志设置到内存缓冲区
 				err = txn.GetMemBuffer().SetWithFlags(key, val, flags...)
 			} else {
+				// 直接将键值对设置到内存缓冲区
 				err = txn.GetMemBuffer().Set(key, val)
 			}
 			if err != nil {
 				return nil, err
 			}
 			if len(tempKey) > 0 {
+				// 如果存在临时键，则编码临时索引值元素并设置到内存缓冲区
 				tempVal := tablecodec.TempIndexValueElem{Value: idxVal, KeyVer: keyVer, Distinct: true}
 				val = tempVal.Encode(value)
 				if lazyCheck && needPresumeNotExists {
@@ -349,8 +376,10 @@ func (c *index) Create(sctx table.MutateContext, txn kv.Transaction, indexedValu
 				continue
 			}
 			if lazyCheck && !txn.IsPessimistic() {
+				// 延迟检查且不是悲观事务，设置断言为 SetAssertUnknown
 				err = txn.SetAssertion(key, kv.SetAssertUnknown)
 			} else {
+				// 其他情况，设置断言为 SetAssertNotExist
 				err = txn.SetAssertion(key, kv.SetAssertNotExist)
 			}
 			if err != nil {
@@ -358,6 +387,7 @@ func (c *index) Create(sctx table.MutateContext, txn kv.Transaction, indexedValu
 			}
 			continue
 		}
+		// 如果键已存在，返回现有条目的句柄
 		if keyIsTempIdxKey && !tempIdxVal.IsEmpty() {
 			value = tempIdxVal.Current().Value
 		}

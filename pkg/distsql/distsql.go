@@ -51,21 +51,28 @@ func GenSelectResultFromMPPResponse(dctx *distsqlctx.DistSQLContext, fieldTypes 
 	}
 }
 
-// Select sends a DAG request, returns SelectResult.
-// In kvReq, KeyRanges is required, Concurrency/KeepOrder/Desc/IsolationLevel/Priority are optional.
+// Select 发送一个 DAG 请求，返回 SelectResult。
+// 在 kvReq 中，KeyRanges 是必需的，Concurrency/KeepOrder/Desc/IsolationLevel/Priority 是可选的。
+// // Select 函数是 TiDB 中分布式 SQL 执行引擎的核心函数之一，它负责发送 DAG (Directed Acyclic Graph，有向无环图)
+//
+//	请求到 TiKV 或 TiFlash 集群，并处理返回的结果。DAG 请求包含了执行计划中需要在 TiKV 或 TiFlash 上执行的操作，例如读取数据、过滤数据、排序数据等。
 func Select(ctx context.Context, dctx *distsqlctx.DistSQLContext, kvReq *kv.Request, fieldTypes []*types.FieldType) (SelectResult, error) {
+	// 使用 tracing 记录 Select 操作的开始和结束时间。
 	r, ctx := tracing.StartRegionEx(ctx, "distsql.Select")
 	defer r.End()
 
-	// For testing purpose.
+	// 用于测试目的的钩子函数，可以用来检查 Select 请求。
 	if hook := ctx.Value("CheckSelectRequestHook"); hook != nil {
 		hook.(func(*kv.Request))(kvReq)
 	}
 
+	// 获取是否启用限速操作。
 	enabledRateLimitAction := dctx.EnabledRateLimitAction
+	// 获取原始 SQL 语句。
 	originalSQL := dctx.OriginalSQL
+	// 定义一个事件回调函数，用于处理 coprocessor 遇到的锁事件。
 	eventCb := func(event trxevents.TransactionEvent) {
-		// Note: Do not assume this callback will be invoked within the same goroutine.
+		// 注意：不要假设此回调将在同一个 goroutine 中被调用。
 		if copMeetLock := event.GetCopMeetLock(); copMeetLock != nil {
 			logutil.Logger(ctx).Debug("coprocessor encounters lock",
 				zap.Uint64("startTS", kvReq.StartTs),
@@ -74,33 +81,39 @@ func Select(ctx context.Context, dctx *distsqlctx.DistSQLContext, kvReq *kv.Requ
 		}
 	}
 
+	// 使用拦截器记录 SQL KV 执行计数器。
 	ctx = WithSQLKvExecCounterInterceptor(ctx, dctx.KvExecCounter)
+	// 创建一个 ClientSendOption，用于配置客户端发送请求的选项。
 	option := &kv.ClientSendOption{
-		SessionMemTracker:          dctx.SessionMemTracker,
-		EnabledRateLimitAction:     enabledRateLimitAction,
-		EventCb:                    eventCb,
-		EnableCollectExecutionInfo: config.GetGlobalConfig().Instance.EnableCollectExecutionInfo.Load(),
+		SessionMemTracker:          dctx.SessionMemTracker,                                              // 用于跟踪会话内存使用情况。
+		EnabledRateLimitAction:     enabledRateLimitAction,                                              // 是否启用限速操作。
+		EventCb:                    eventCb,                                                             // 事件回调函数。
+		EnableCollectExecutionInfo: config.GetGlobalConfig().Instance.EnableCollectExecutionInfo.Load(), // 是否启用收集执行信息。
 	}
 
+	// 如果存储类型是 TiFlash，则在上下文中设置 TiFlash 配置变量，并配置 TiFlash 副本读取选项。
 	if kvReq.StoreType == kv.TiFlash {
 		ctx = SetTiFlashConfVarsInContext(ctx, dctx)
 		option.TiFlashReplicaRead = dctx.TiFlashReplicaRead
 		option.AppendWarning = dctx.AppendWarning
 	}
 
+	// 使用客户端发送 DAG 请求。
 	resp := dctx.Client.Send(ctx, kvReq, dctx.KVVars, option)
+	// 如果响应为空，则返回错误。
 	if resp == nil {
 		return nil, errors.New("client returns nil response")
 	}
 
+	// 设置指标标签。
 	label := metrics.LblGeneral
 	if dctx.InRestrictedSQL {
 		label = metrics.LblInternal
 	}
 
-	// kvReq.MemTracker is used to trace and control memory usage in DistSQL layer;
-	// for selectResult, we just use the kvReq.MemTracker prepared for co-processor
-	// instead of creating a new one for simplification.
+	// kvReq.MemTracker 用于跟踪和控制 DistSQL 层的内存使用情况；
+	// 对于 selectResult，我们只是使用为 coprocessor 准备的 kvReq.MemTracker，而不是为了简化而创建一个新的。
+	// 创建并返回一个 selectResult，用于处理 DAG 请求的响应。
 	return &selectResult{
 		label:              "dag",
 		resp:               resp,

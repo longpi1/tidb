@@ -963,29 +963,43 @@ func (t *TableCommon) AddRecord(sctx table.MutateContext, r []types.Datum, opts 
 	// a reusable buffer to save malloc
 	// Note: The buffer should not be referenced or modified outside this function.
 	// It can only act as a temporary buffer for the current function call.
+
+	// 获取 TablesBuffer 并添加一行数据。
 	buffer := sctx.GetTablesBuffer().Add
+	// 确保 ColIDs 和 Row 数组有足够的容量，并将它们重置为空。
 	buffer.ColIDs = ensureCapacityAndReset(buffer.ColIDs, 0, len(r))
 	buffer.Row = ensureCapacityAndReset(buffer.Row, 0, len(r))
+
+	// 获取内存缓冲区和 staging 缓冲区。
 	memBuffer := txn.GetMemBuffer()
 	sh := memBuffer.Staging()
+	// 延迟清理 staging 缓冲区。
 	defer memBuffer.Cleanup(sh)
 
+	// 获取 session 变量。
 	sessVars := sctx.GetSessionVars()
+	// 初始化校验和数据。
 	checksumData := t.initChecksumData(sctx, recordID)
+	// 是否需要计算校验和。
 	needChecksum := len(checksumData) > 0
 
+	// 遍历表的每一列。
 	for _, col := range t.Columns {
 		var value types.Datum
+		// 如果列处于 DeleteOnly 或 DeleteReorganization 状态，则跳过该列。
 		if col.State == model.StateDeleteOnly || col.State == model.StateDeleteReorganization {
+			// 如果需要计算校验和，则根据列的状态更新校验和数据。
 			if needChecksum {
 				if col.ChangeStateInfo != nil {
-					// TODO: Check overflow or ignoreTruncate.
+					// 如果列正在进行类型更改，则使用依赖列的值计算校验和。
+					// TODO: 检查溢出或忽略截断。
 					v, err := table.CastColumnValue(sctx.GetExprCtx(), r[col.DependencyColumnOffset], col.ColumnInfo, false, false)
 					if err != nil {
 						return nil, err
 					}
 					checksumData = t.appendInChangeColForChecksum(sctx, recordID, checksumData, col.ToInfo(), &r[col.DependencyColumnOffset], &v)
 				} else {
+					// 否则，使用列的默认值计算校验和。
 					v, err := table.GetColOriginDefaultValue(sctx.GetExprCtx(), col.ToInfo())
 					if err != nil {
 						return nil, err
@@ -995,24 +1009,28 @@ func (t *TableCommon) AddRecord(sctx table.MutateContext, r []types.Datum, opts 
 			}
 			continue
 		}
-		// In column type change, since we have set the origin default value for changing col, but
-		// for the new insert statement, we should use the casted value of relative column to insert.
+
+		// 如果列正在进行类型更改，并且列的状态不是 Public，则使用转换后的依赖列的值插入。
 		if col.ChangeStateInfo != nil && col.State != model.StatePublic {
-			// TODO: Check overflow or ignoreTruncate.
+			// TODO: 检查溢出或忽略截断。
 			value, err = table.CastColumnValue(sctx.GetExprCtx(), r[col.DependencyColumnOffset], col.ColumnInfo, false, false)
 			if err != nil {
 				return nil, err
 			}
+			// 将转换后的值添加到 r 数组中。
 			if len(r) < len(t.WritableCols()) {
 				r = append(r, value)
 			} else {
 				r[col.Offset] = value
 			}
+			// 将转换后的值添加到 buffer 中。
 			buffer.Row = append(buffer.Row, value)
 			buffer.ColIDs = append(buffer.ColIDs, col.ID)
+			// 更新校验和数据。
 			checksumData = t.appendInChangeColForChecksum(sctx, recordID, checksumData, col.ToInfo(), &r[col.DependencyColumnOffset], &value)
 			continue
 		}
+
 		if col.State == model.StatePublic {
 			value = r[col.Offset]
 			checksumData = t.appendPublicColForChecksum(sctx, recordID, checksumData, col.ToInfo(), &value)
@@ -1047,21 +1065,31 @@ func (t *TableCommon) AddRecord(sctx table.MutateContext, r []types.Datum, opts 
 		}
 	}
 	// check data constraint
+	// 检查数据约束
 	err = t.CheckRowConstraint(sctx, r)
 	if err != nil {
+		// 如果检查约束失败，则返回错误
 		return nil, err
 	}
+
+	//获取写语句缓冲
 	writeBufs := sessVars.GetWriteStmtBufs()
+	//调整行值缓冲
 	adjustRowValuesBuf(writeBufs, len(buffer.Row))
-	// 构造 Row key:
+
+	//构造Row key
 	key := t.RecordKey(recordID)
 	sc, rd := sessVars.StmtCtx, &sessVars.RowEncoder
+	//计算 checksum
 	checksums, writeBufs.RowValBuf = t.calcChecksums(sctx, recordID, checksumData, writeBufs.RowValBuf)
-	// 构造 Row Value:
+
+	//构造 Row Value
 	writeBufs.RowValBuf, err = tablecodec.EncodeRow(sc.TimeZone(), buffer.Row, buffer.ColIDs,
 		writeBufs.RowValBuf, writeBufs.AddRowValues, rd, checksums...)
+	//处理错误
 	err = sc.HandleError(err)
 	if err != nil {
+		// 如果处理错误失败，则返回错误
 		return nil, err
 	}
 	value := writeBufs.RowValBuf
@@ -1084,14 +1112,17 @@ func (t *TableCommon) AddRecord(sctx table.MutateContext, r []types.Datum, opts 
 			_, err = txn.Get(ctx, key)
 		}
 		if err == nil {
+			// 如果 key 不存在，则返回错误
 			handleStr := getDuplicateErrorHandleString(t.Meta(), recordID, r)
 			return recordID, kv.ErrKeyExists.FastGenByArgs(handleStr, t.Meta().Name.String()+".PRIMARY")
 		} else if !kv.ErrNotExist.Equal(err) {
+			// 如果 key 存在，但不是 PRIMARY key，则返回错误
 			return recordID, err
 		}
 	}
 
 	if setPresume {
+		// 如果 presume key 不存在，则设置 presume 选项
 		flags := []kv.FlagsOp{kv.SetPresumeKeyNotExists}
 		if !sessVars.ConstraintCheckInPlacePessimistic && sessVars.TxnCtx.IsPessimistic && sessVars.InTxn() &&
 			!sessVars.InRestrictedSQL && sessVars.ConnectionID > 0 {
@@ -1099,15 +1130,18 @@ func (t *TableCommon) AddRecord(sctx table.MutateContext, r []types.Datum, opts 
 		}
 		err = memBuffer.SetWithFlags(key, value, flags...)
 	} else {
+		// 如果不需要 presume 选项，则直接设置 key
 		err = memBuffer.Set(key, value)
 	}
 	if err != nil {
+		// 如果设置失败，则返回错误
 		return nil, err
 	}
 
+	//.inject failpointorney
 	failpoint.Inject("addRecordForceAssertExist", func() {
-		// Assert the key exists while it actually doesn't. This is helpful to test if assertion takes effect.
-		// Since only the first assertion takes effect, set the injected assertion before setting the correct one to
+		// force asserting exist on AddRecord
+		// since only the first assertion takes effect, set the injected assertion before setting the correct one to
 		// override it.
 		if sctx.GetSessionVars().ConnectionID != 0 {
 			logutil.BgLogger().Info("force asserting exist on AddRecord", zap.String("category", "failpoint"), zap.Uint64("startTS", txn.StartTS()))
@@ -1116,15 +1150,18 @@ func (t *TableCommon) AddRecord(sctx table.MutateContext, r []types.Datum, opts 
 			}
 		}
 	})
+	// 设置 assert 选项
 	if setPresume && !txn.IsPessimistic() {
 		err = txn.SetAssertion(key, kv.SetAssertUnknown)
 	} else {
 		err = txn.SetAssertion(key, kv.SetAssertNotExist)
 	}
 	if err != nil {
+		// 如果设置失败，则返回错误
 		return nil, err
 	}
 
+	//构造 Index 数据
 	var createIdxOpts []table.CreateIdxOptFunc
 	if len(opts) > 0 {
 		createIdxOpts = make([]table.CreateIdxOptFunc, 0, len(opts))
@@ -1134,9 +1171,10 @@ func (t *TableCommon) AddRecord(sctx table.MutateContext, r []types.Datum, opts 
 			}
 		}
 	}
-	// Insert new entries into indices.  构造 Index 数据
+	//插入新记录
 	h, err := t.addIndices(sctx, recordID, r, txn, createIdxOpts)
 	if err != nil {
+		// 如果插入失败，则返回错误
 		return h, err
 	}
 
